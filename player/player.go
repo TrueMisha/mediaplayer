@@ -8,13 +8,14 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
-	"github.com/eiannone/keyboard"
 	"github.com/faiface/beep"
 	"github.com/faiface/beep/mp3"
 	"github.com/faiface/beep/speaker"
 	"github.com/fatih/color"
+	"github.com/gdamore/tcell/v2"
 
 	"soundcloud_player/soundcloud"
 	"soundcloud_player/ui"
@@ -23,7 +24,7 @@ import (
 
 type KeyEvent struct {
 	Char rune
-	Key  keyboard.Key
+	Key  tcell.Key
 }
 
 type nopCloser struct {
@@ -32,29 +33,35 @@ type nopCloser struct {
 
 func (nopCloser) Close() error { return nil }
 
+var speakerMu sync.Mutex
+
 func formatDuration(d time.Duration) string {
 	min := int(d.Minutes())
 	sec := int(d.Seconds()) % 60
 	return fmt.Sprintf("%02d:%02d", min, sec)
 }
 
-func readKeys(ctx context.Context, keyChan chan<- KeyEvent) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			char, key, err := keyboard.GetKey()
-			if err != nil {
-				log.Printf("Ошибка клавиатуры: %v", err)
-				continue
+func StartKeyboardListener(ctx context.Context, screen tcell.Screen, keyChan chan KeyEvent) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				ev := screen.PollEvent()
+				switch tev := ev.(type) {
+				case *tcell.EventKey:
+					keyChan <- KeyEvent{
+						Char: tev.Rune(),
+						Key:  tev.Key(),
+					}
+				}
 			}
-			keyChan <- KeyEvent{Char: char, Key: key}
 		}
-	}
+	}()
 }
 
-func PlayWithControls(tracks []soundcloud.Track, startIndex int, keyChan <-chan KeyEvent) {
+func PlayWithControls(tracks []soundcloud.Track, startIndex int, keyChan <-chan KeyEvent, screen tcell.Screen) {
 	idx := startIndex
 
 	for {
@@ -67,8 +74,7 @@ func PlayWithControls(tracks []soundcloud.Track, startIndex int, keyChan <-chan 
 		ui.PrintHeader()
 		fmt.Printf("▶ Попытка воспроизведения: %s\n", tracks[idx].Title)
 
-		streamURL := tracks[idx].StreamURL
-		resp, err := http.Get(streamURL)
+		resp, err := http.Get(tracks[idx].StreamURL)
 		if err != nil {
 			log.Printf("Ошибка загрузки трека: %v\n", err)
 			idx++
@@ -94,19 +100,25 @@ func PlayWithControls(tracks []soundcloud.Track, startIndex int, keyChan <-chan 
 		streamerOriginal.Close()
 		streamer := buffer.Streamer(0, buffer.Len())
 
+		speakerMu.Lock()
 		speaker.Clear()
+		speaker.Close()
 		if err := speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10)); err != nil {
+			speakerMu.Unlock()
 			log.Printf("Ошибка speaker.Init: %v\n", err)
 			idx++
 			continue
 		}
+		speakerMu.Unlock()
 
 		ctrl := &beep.Ctrl{Streamer: streamer, Paused: false}
 		done := make(chan bool)
 		go func() {
+			speakerMu.Lock()
 			speaker.Play(beep.Seq(ctrl, beep.Callback(func() {
 				done <- true
 			})))
+			speakerMu.Unlock()
 		}()
 
 		utils.ClearConsole()
@@ -121,32 +133,41 @@ func PlayWithControls(tracks []soundcloud.Track, startIndex int, keyChan <-chan 
 			select {
 			case <-done:
 				fmt.Println("\n✅ Трек завершён")
+				speakerMu.Lock()
 				speaker.Clear()
+				speakerMu.Unlock()
 				goto nextTrack
 
 			case keyEvent := <-keyChan:
 				switch {
 				case keyEvent.Char == 'q':
 					fmt.Println("\n⏹ Выход...")
+					speakerMu.Lock()
 					speaker.Clear()
+					speakerMu.Unlock()
 					return
 
 				case keyEvent.Char == 'n':
 					fmt.Println("\n⏭ Следующий трек...")
+					speakerMu.Lock()
 					speaker.Clear()
+					speakerMu.Unlock()
 					goto nextTrack
 
-				case keyEvent.Char == 'p' || keyEvent.Key == keyboard.KeySpace:
+				case keyEvent.Char == 'p' || (keyEvent.Key == tcell.KeyRune && keyEvent.Char == ' '):
+					speakerMu.Lock()
 					speaker.Lock()
 					ctrl.Paused = !ctrl.Paused
 					speaker.Unlock()
+					speakerMu.Unlock()
 					if ctrl.Paused {
 						fmt.Println("\n⏸ Пауза")
 					} else {
 						fmt.Println("\n▶ Воспроизведение")
 					}
 
-				case keyEvent.Key == keyboard.KeyArrowLeft:
+				case keyEvent.Key == tcell.KeyLeft:
+					speakerMu.Lock()
 					speaker.Lock()
 					step := format.SampleRate.N(time.Second * 30)
 					newPos := streamer.Position() - step
@@ -155,9 +176,11 @@ func PlayWithControls(tracks []soundcloud.Track, startIndex int, keyChan <-chan 
 					}
 					_ = streamer.Seek(newPos)
 					speaker.Unlock()
+					speakerMu.Unlock()
 					fmt.Println("\n⏪ Назад на 30 секунд")
 
-				case keyEvent.Key == keyboard.KeyArrowRight:
+				case keyEvent.Key == tcell.KeyRight:
+					speakerMu.Lock()
 					speaker.Lock()
 					step := format.SampleRate.N(time.Second * 30)
 					newPos := streamer.Position() + step
@@ -166,14 +189,24 @@ func PlayWithControls(tracks []soundcloud.Track, startIndex int, keyChan <-chan 
 					}
 					_ = streamer.Seek(newPos)
 					speaker.Unlock()
+					speakerMu.Unlock()
 					fmt.Println("\n⏩ Вперёд на 30 секунд")
 
 				case keyEvent.Char == 's':
+					speakerMu.Lock()
 					speaker.Clear()
+					speakerMu.Unlock()
+
+					screen.Fini()
+
 					fmt.Println("\n🔁 Новый поиск")
 					fmt.Print("Введите новый запрос: ")
 					var newQuery string
 					fmt.Scanln(&newQuery)
+
+					if err := screen.Init(); err != nil {
+						log.Fatalf("Ошибка повторной инициализации экрана: %v", err)
+					}
 
 					clientID := os.Getenv("SOUNDCLOUD_CLIENT_ID")
 					newTracks, err := soundcloud.GetTracks(newQuery, clientID)
@@ -200,8 +233,4 @@ func PlayWithControls(tracks []soundcloud.Track, startIndex int, keyChan <-chan 
 	nextTrack:
 		idx++
 	}
-}
-
-func StartKeyboardListener(ctx context.Context, keyChan chan KeyEvent) {
-	go readKeys(ctx, keyChan)
 }

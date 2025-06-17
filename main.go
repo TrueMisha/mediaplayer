@@ -4,27 +4,27 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"log"
+	"github.com/gdamore/tcell/v2"
+	"github.com/joho/godotenv"
 	"math/rand"
 	"os"
-	"strings"
-	"time"
-
-	"github.com/eiannone/keyboard"
-	"github.com/joho/godotenv"
-
+	"os/signal"
 	"soundcloud_player/player"
 	"soundcloud_player/soundcloud"
 	"soundcloud_player/ui"
+	"strings"
+	"syscall"
+	"time"
 )
 
 func main() {
 	ui.PrintHeader()
-	err := godotenv.Load()
-	if err != nil {
+
+	if err := godotenv.Load(); err != nil {
 		ui.PrintError("Ошибка загрузки .env файла")
 		return
 	}
+
 	clientID := os.Getenv("SOUNDCLOUD_CLIENT_ID")
 	if clientID == "" {
 		ui.PrintError("Переменная SOUNDCLOUD_CLIENT_ID не найдена в .env")
@@ -67,14 +67,29 @@ func main() {
 		idx--
 	}
 
-	if err := keyboard.Open(); err != nil {
-		log.Fatalf("Ошибка открытия клавиатуры: %v", err)
+	screen, err := tcell.NewScreen()
+	if err != nil {
+		ui.PrintError(fmt.Sprintf("Ошибка создания экрана: %v", err))
+		return
 	}
-	defer keyboard.Close()
+	if err := screen.Init(); err != nil {
+		ui.PrintError(fmt.Sprintf("Ошибка инициализации экрана: %v", err))
+		return
+	}
+	defer screen.Fini()
+
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		screen.Fini()
+		os.Exit(0)
+	}()
+
 	keyChan := make(chan player.KeyEvent)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	player.StartKeyboardListener(ctx, keyChan)
-	player.PlayWithControls(tracks, idx, keyChan)
+	player.StartKeyboardListener(ctx, screen, keyChan)
+	player.PlayWithControls(tracks, idx, keyChan, screen)
 }
